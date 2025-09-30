@@ -1,0 +1,440 @@
+# Step 1: Install required packages
+!pip install transformers torch nltk sentencepiece datasets accelerate -q
+!pip install sentence-transformers -q
+
+# Step 2: Import libraries
+import torch
+import transformers
+from transformers import (
+    T5ForConditionalGeneration, 
+    T5Tokenizer,
+    pipeline,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer
+)
+import nltk
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple
+import re
+import json
+from datetime import datetime
+
+# Step 3: Download ALL required NLTK data
+print("📥 Downloading NLTK data...")
+nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('brown', quiet=True)
+print("✅ NLTK data downloaded successfully!")
+
+# Step 4: Define the Exam Question Generator Class
+class ExamQuestionGenerator:
+    def __init__(self):
+        self.setup_models()
+        
+    def setup_models(self):
+        """Initialize all required models"""
+        print("🔄 Loading models... This may take a few minutes...")
+        
+        # Use smaller, faster models for Colab
+        self.qg_model_name = "valhalla/t5-small-qg-prepend"
+        print(f"📥 Loading {self.qg_model_name}...")
+        self.qg_tokenizer = T5Tokenizer.from_pretrained(self.qg_model_name)
+        self.qg_model = T5ForConditionalGeneration.from_pretrained(self.qg_model_name)
+        
+        # Alternative model
+        self.alt_model_name = "mrm8488/t5-small-finetuned-question-generation-ap"
+        print(f"📥 Loading {self.alt_model_name}...")
+        self.alt_tokenizer = AutoTokenizer.from_pretrained(self.alt_model_name)
+        self.alt_model = AutoModelForSeq2SeqLM.from_pretrained(self.alt_model_name)
+        
+        # QA model for answer verification
+        print("🔄 Loading QA model...")
+        self.qa_pipeline = pipeline(
+            "question-answering",
+            model="distilbert-base-cased-distilled-squad",
+            tokenizer="distilbert-base-cased"
+        )
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"✅ Using device: {self.device}")
+        
+        # Move models to device
+        self.qg_model.to(self.device)
+        self.alt_model.to(self.device)
+        
+        print("✅ All models loaded successfully!")
+        
+    def preprocess_context(self, text: str) -> str:
+        """Clean and prepare context for question generation"""
+        # Remove extra whitespaces
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Ensure proper sentence boundaries
+        try:
+            sentences = nltk.sent_tokenize(text)
+            return ' '.join(sentences[:3])  # Use first 3 sentences for better performance
+        except:
+            # Fallback if tokenization fails
+            return ' '.join(text.split('.')[:2]) + '.'
+    
+    def generate_questions_t5(self, context: str, num_questions: int = 2) -> List[Dict]:
+        """Generate questions using T5 model"""
+        try:
+            context = self.preprocess_context(context)
+            
+            inputs = self.qg_tokenizer.encode(
+                "generate questions: " + context,
+                return_tensors="pt",
+                max_length=256,  # Reduced for stability
+                truncation=True
+            ).to(self.device)
+            
+            outputs = self.qg_model.generate(
+                inputs,
+                max_length=50,
+                num_return_sequences=num_questions,
+                num_beams=num_questions * 2,
+                early_stopping=True,
+                temperature=0.9,
+                do_sample=True
+            )
+            
+            questions = []
+            for output in outputs:
+                question = self.qg_tokenizer.decode(output, skip_special_tokens=True)
+                if question and len(question) > 8 and '?' in question:  # Better validation
+                    questions.append({
+                        'question': question,
+                        'context': context,
+                        'model': 't5'
+                    })
+                    
+            return questions[:num_questions]
+        except Exception as e:
+            print(f"⚠️ T5 model error: {e}")
+            return []
+    
+    def generate_questions_alternative(self, context: str, num_questions: int = 2) -> List[Dict]:
+        """Generate questions using alternative model"""
+        try:
+            context = self.preprocess_context(context)
+            
+            input_text = f"answer: {context} context: {context}"
+            inputs = self.alt_tokenizer.encode(
+                input_text, 
+                return_tensors="pt", 
+                max_length=256, 
+                truncation=True
+            )
+            
+            outputs = self.alt_model.generate(
+                inputs.to(self.device),
+                max_length=50,
+                num_return_sequences=num_questions,
+                num_beams=num_questions * 2,
+                early_stopping=True,
+                temperature=0.9
+            )
+            
+            questions = []
+            for output in outputs:
+                question = self.alt_tokenizer.decode(output, skip_special_tokens=True)
+                if question and len(question) > 8 and not question.startswith('answer:'):
+                    questions.append({
+                        'question': question,
+                        'context': context,
+                        'model': 'alternative'
+                    })
+                    
+            return questions[:num_questions]
+        except Exception as e:
+            print(f"⚠️ Alternative model error: {e}")
+            return []
+    
+    def extract_answer(self, question: str, context: str) -> str:
+        """Extract answer from context using QA model"""
+        try:
+            # Clean the question for better QA performance
+            clean_question = re.sub(r'[^\w\s?]', '', question)
+            result = self.qa_pipeline(question=clean_question, context=context)
+            return result['answer'] if result['score'] > 0.1 else "Answer requires calculation"
+        except:
+            return "Answer derived from context"
+    
+    def generate_multiple_choice_options(self, correct_answer: str, subject: str) -> List[str]:
+        """Generate plausible multiple choice options"""
+        options = [correct_answer]
+        
+        # Subject-specific dummy options
+        if subject.lower() in ['physics', 'maths']:
+            dummy_options = [
+                "None of the above",
+                "Both A and B", 
+                "Data insufficient",
+                "Zero"
+            ]
+        elif subject.lower() in ['chemistry']:
+            dummy_options = [
+                "No reaction occurred",
+                "Both B and C",
+                "Cannot be determined",
+                "All of the above"
+            ]
+        else:  # biology
+            dummy_options = [
+                "None of the above",
+                "All of the above", 
+                "Both A and C",
+                "Data insufficient"
+            ]
+        
+        options.extend(dummy_options[:3])
+        return options
+    
+    def categorize_question(self, question: str, context: str) -> Dict:
+        """Categorize question by type and difficulty"""
+        question_lower = question.lower()
+        
+        # Determine question type
+        if any(word in question_lower for word in ['calculate', 'compute', 'find the value', 'solve']):
+            q_type = "Numerical"
+            difficulty = "Medium"
+        elif any(word in question_lower for word in ['why', 'explain', 'reason', 'describe', 'how']):
+            q_type = "Conceptual"
+            difficulty = "Hard"
+        elif any(word in question_lower for word in ['define', 'what is meant by', 'what does']):
+            q_type = "Definition"
+            difficulty = "Easy"
+        else:
+            q_type = "Factual"
+            difficulty = "Easy"
+            
+        return {"type": q_type, "difficulty": difficulty}
+    
+    def generate_exam_questions(self, context: str, subject: str, num_questions: int = 4) -> List[Dict]:
+        """Main method to generate complete questions with answers"""
+        print(f"🎯 Generating {num_questions} questions for {subject}...")
+        
+        # Generate questions from both models
+        t5_questions = self.generate_questions_t5(context, min(2, num_questions))
+        alt_questions = self.generate_questions_alternative(context, min(2, num_questions))
+        
+        all_questions = t5_questions + alt_questions
+        
+        complete_questions = []
+        
+        for i, q_data in enumerate(all_questions[:num_questions]):
+            question = q_data['question']
+            context_used = q_data['context']
+            
+            # Extract answer
+            answer = self.extract_answer(question, context_used)
+            
+            # Categorize question
+            category_info = self.categorize_question(question, context_used)
+            
+            # Generate multiple choice options for certain question types
+            options = None
+            if category_info['type'] in ['Numerical', 'Factual']:
+                options = self.generate_multiple_choice_options(answer, subject)
+            
+            complete_question = {
+                'id': i + 1,
+                'question': question,
+                'context': context_used,
+                'answer': answer,
+                'subject': subject,
+                'type': category_info['type'],
+                'difficulty': category_info['difficulty'],
+                'options': options,
+                'model_used': q_data['model']
+            }
+            
+            complete_questions.append(complete_question)
+        
+        print(f"✅ Generated {len(complete_questions)} questions for {subject}")
+        return complete_questions
+
+# Step 5: Initialize the system
+print("🚀 Initializing Exam Question Generator...")
+qg = ExamQuestionGenerator()
+
+# Step 6: Define optimized contexts for better question generation
+jee_physics_context = """
+Newton's second law states that force equals mass times acceleration (F=ma). 
+This fundamental law explains how objects move when forces are applied. 
+Acceleration is directly proportional to force and inversely proportional to mass.
+"""
+
+jee_chemistry_context = """
+The ideal gas law is PV=nRT where P is pressure, V is volume, n is moles, R is gas constant, and T is temperature. 
+This equation combines Boyle's law and Charles's law. It works best for ideal gases at standard conditions.
+"""
+
+jee_maths_context = """
+The quadratic formula x = [-b ± √(b²-4ac)]/2a solves equations of form ax²+bx+c=0. 
+The discriminant b²-4ac determines if roots are real or complex. This is essential in algebra.
+"""
+
+neet_biology_context = """
+Photosynthesis converts light energy to chemical energy in plants. 
+The overall reaction is 6CO₂ + 6H₂O → C₆H₁₂O₆ + 6O₂. 
+This process occurs in chloroplasts and has light and dark reactions.
+"""
+
+neet_physics_context = """
+Ohm's Law states V=IR where V is voltage, I is current, and R is resistance. 
+This fundamental law relates these three electrical quantities. 
+It applies to ohmic conductors at constant temperature.
+"""
+
+neet_chemistry_context = """
+pH measures acidity using pH=-log[H⁺]. Values below 7 are acidic, above 7 are basic. 
+The scale ranges from 0-14. Strong acids have low pH values while bases have high pH.
+"""
+
+# Step 7: Create a function to display questions beautifully
+def display_questions(questions, subject):
+    print(f"\n{'='*60}")
+    print(f"📚 {subject.upper()} QUESTIONS")
+    print(f"{'='*60}")
+    
+    for q in questions:
+        print(f"\n🔹 Question {q['id']} ({q['type']} - {q['difficulty']}):")
+        print(f"   {q['question']}")
+        
+        if q['options']:
+            print("   Options:")
+            for idx, opt in enumerate(q['options']):
+                print(f"      {chr(65+idx)}. {opt}")
+        
+        print(f"   ✅ Answer: {q['answer']}")
+        print("-" * 50)
+
+# Step 8: Generate and display questions for all subjects
+def generate_all_subjects_questions():
+    subjects_contexts = {
+        "JEE Physics": jee_physics_context,
+        "JEE Chemistry": jee_chemistry_context, 
+        "JEE Mathematics": jee_maths_context,
+        "NEET Biology": neet_biology_context,
+        "NEET Physics": neet_physics_context,
+        "NEET Chemistry": neet_chemistry_context
+    }
+    
+    all_questions = {}
+    
+    for subject, context in subjects_contexts.items():
+        questions = qg.generate_exam_questions(context, subject, num_questions=2)
+        all_questions[subject] = questions
+        if questions:  # Only display if questions were generated
+            display_questions(questions, subject)
+        else:
+            print(f"\n❌ No questions generated for {subject}")
+    
+    return all_questions
+
+# Step 9: Run the question generation
+print("🎉 Starting Question Generation for JEE & NEET Preparation!")
+print("Please wait while we generate high-quality questions...\n")
+
+all_questions = generate_all_subjects_questions()
+
+# Step 10: Save results
+def save_questions(questions_dict):
+    """Save questions to a JSON file"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"jee_neet_questions_{timestamp}.json"
+        
+        # Convert to serializable format
+        serializable_questions = {}
+        for subject, questions in questions_dict.items():
+            serializable_questions[subject] = []
+            for q in questions:
+                serializable_q = q.copy()
+                if serializable_q['options'] is not None:
+                    serializable_q['options'] = list(serializable_q['options'])
+                serializable_questions[subject].append(serializable_q)
+        
+        with open(filename, 'w') as f:
+            json.dump(serializable_questions, f, indent=2)
+        
+        print(f"\n💾 Questions saved as: {filename}")
+        
+        # Show summary
+        total_questions = sum(len(q) for q in questions_dict.values())
+        print(f"📊 Generated {total_questions} questions across {len(questions_dict)} subjects")
+        
+        return filename
+    except Exception as e:
+        print(f"❌ Error saving questions: {e}")
+        return None
+
+# Save the questions
+saved_file = save_questions(all_questions)
+
+# Step 11: Interactive question generation
+def interactive_mode():
+    """Allow users to input their own context"""
+    print("\n🎮 INTERACTIVE MODE")
+    print("=" * 50)
+    
+    while True:
+        print("\nChoose an option:")
+        print("1. Generate questions from predefined contexts")
+        print("2. Input your own context")
+        print("3. Exit")
+        
+        choice = input("\nEnter your choice (1-3): ").strip()
+        
+        if choice == '1':
+            print("\nRegenerating questions...")
+            new_questions = generate_all_subjects_questions()
+            save_questions(new_questions)
+            
+        elif choice == '2':
+            subject = input("Enter subject (e.g., Physics, Chemistry): ").strip()
+            context = input("Enter your study material/context: ").strip()
+            num_questions = input("Number of questions to generate (1-4): ").strip()
+            
+            if not num_questions.isdigit():
+                num_questions = 2
+            else:
+                num_questions = min(int(num_questions), 4)
+            
+            if context:
+                print(f"\nGenerating {num_questions} questions for {subject}...")
+                questions = qg.generate_exam_questions(context, subject, num_questions)
+                if questions:
+                    display_questions(questions, subject)
+                    
+                    # Ask if user wants to save
+                    save_choice = input("\nSave these questions? (y/n): ").lower()
+                    if save_choice == 'y':
+                        save_questions({f"Custom {subject}": questions})
+                else:
+                    print("❌ No questions could be generated from this context.")
+            else:
+                print("❌ Please provide some context!")
+                
+        elif choice == '3':
+            print("👋 Thank you for using the JEE/NEET Question Generator!")
+            break
+        else:
+            print("❌ Invalid choice! Please try again.")
+
+# Step 12: Display completion message
+print("\n" + "="*60)
+print("🚀 JEE/NEET AI Question Generator - READY!")
+print("="*60)
+print("\n📚 Available Commands:")
+print("   • 'generate_all_subjects_questions()' - Regenerate all questions")
+print("   • 'interactive_mode()' - Enter interactive mode")
+print("   • 'qg.generate_exam_questions(context, subject, num_questions)' - Custom generation")
+
+# Uncomment the line below to automatically start interactive mode
+# interactive_mode()
+
+print("\n🎯 Try running: interactive_mode()")
